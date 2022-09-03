@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -52,12 +53,80 @@ type UploadedFile struct {
 	FileSize         int64
 }
 
-func (t *Tools) UploadFiles(r *http.Request, uploadDir string, rename ...bool) ([]*UploadedFile, error) {
-	renameFile := true
+type UploadFilesParams struct {
+	uploadedFiles []*UploadedFile
+	header        *multipart.FileHeader
+	t             *Tools
+	renameFile    bool
+	uploadDir     string
+}
 
-	if len(rename) > 0 {
-		renameFile = rename[0]
+func uploadFiles(ufp UploadFilesParams) ([]*UploadedFile, error) {
+	uploadedFiles, header, t, renameFile, uploadDir := ufp.uploadedFiles, ufp.header, ufp.t, ufp.renameFile, ufp.uploadDir
+
+	var uploadedFile UploadedFile
+	inFile, err := header.Open()
+	if err != nil {
+		return nil, err
 	}
+	defer inFile.Close()
+
+	buff := make([]byte, 512)
+	_, err = inFile.Read(buff)
+	if err != nil {
+		return nil, err
+	}
+
+	//check to see if the file type is permitted
+	allowed := false
+	fileType := http.DetectContentType(buff)
+
+	if len(t.AllowedFileTypes) > 0 {
+		for _, typeReceived := range t.AllowedFileTypes {
+			if strings.EqualFold(fileType, typeReceived) {
+				allowed = true
+			}
+		}
+	} else {
+		allowed = true
+	}
+
+	if !allowed {
+		return nil, errors.New("the uploaded file type is not permitted")
+	}
+
+	_, err = inFile.Seek(0, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	uploadedFile.OriginalFileName = header.Filename
+
+	if renameFile {
+		uploadedFile.NewFileName = fmt.Sprintf("%s%s", t.RandomString(25), filepath.Ext(header.Filename))
+	} else {
+		uploadedFile.NewFileName = header.Filename
+	}
+
+	var outfile *os.File
+	defer outfile.Close()
+
+	if outfile, err = os.Create(filepath.Join(uploadDir, uploadedFile.NewFileName)); err != nil {
+		return nil, err
+	} else {
+		fileSize, err := io.Copy(outfile, inFile)
+		if err != nil {
+			return nil, err
+		}
+		uploadedFile.FileSize = fileSize
+	}
+
+	uploadedFiles = append(uploadedFiles, &uploadedFile)
+	return uploadedFiles, nil
+}
+
+func (t *Tools) UploadFiles(r *http.Request, uploadDir string, rename ...bool) ([]*UploadedFile, error) {
+	renameFile := shouldRenameFile(rename...)
 
 	var uploadedFiles []*UploadedFile
 
@@ -73,67 +142,7 @@ func (t *Tools) UploadFiles(r *http.Request, uploadDir string, rename ...bool) (
 
 	for _, fHeaders := range r.MultipartForm.File {
 		for _, header := range fHeaders {
-			uploadedFiles, err = func(uploadedFiles []*UploadedFile) ([]*UploadedFile, error) {
-				var uploadedFile UploadedFile
-				inFile, err := header.Open()
-				if err != nil {
-					return nil, err
-				}
-				defer inFile.Close()
-
-				buff := make([]byte, 512)
-				_, err = inFile.Read(buff)
-				if err != nil {
-					return nil, err
-				}
-
-				//check to see if the file type is permitted
-				allowed := false
-				fileType := http.DetectContentType(buff)
-
-				if len(t.AllowedFileTypes) > 0 {
-					for _, typeReceived := range t.AllowedFileTypes {
-						if strings.EqualFold(fileType, typeReceived) {
-							allowed = true
-						}
-					}
-				} else {
-					allowed = true
-				}
-
-				if !allowed {
-					return nil, errors.New("the uploaded file type is not permitted")
-				}
-
-				_, err = inFile.Seek(0, 0)
-				if err != nil {
-					return nil, err
-				}
-
-				uploadedFile.OriginalFileName = header.Filename
-
-				if renameFile {
-					uploadedFile.NewFileName = fmt.Sprintf("%s%s", t.RandomString(25), filepath.Ext(header.Filename))
-				} else {
-					uploadedFile.NewFileName = header.Filename
-				}
-
-				var outfile *os.File
-				defer outfile.Close()
-
-				if outfile, err = os.Create(filepath.Join(uploadDir, uploadedFile.NewFileName)); err != nil {
-					return nil, err
-				} else {
-					fileSize, err := io.Copy(outfile, inFile)
-					if err != nil {
-						return nil, err
-					}
-					uploadedFile.FileSize = fileSize
-				}
-
-				uploadedFiles = append(uploadedFiles, &uploadedFile)
-				return uploadedFiles, nil
-			}(uploadedFiles)
+			uploadedFiles, err = uploadFiles(UploadFilesParams{uploadedFiles, header, t, renameFile, uploadDir})
 			if err != nil {
 				return uploadedFiles, err
 			}
@@ -143,11 +152,7 @@ func (t *Tools) UploadFiles(r *http.Request, uploadDir string, rename ...bool) (
 }
 
 func (t *Tools) UploadOneFile(r *http.Request, uploadDir string, rename ...bool) (*UploadedFile, error) {
-	renameFile := true
-
-	if len(rename) > 0 {
-		renameFile = rename[0]
-	}
+	renameFile := shouldRenameFile(rename...)
 
 	files, err := t.UploadFiles(r, uploadDir, renameFile)
 
@@ -156,4 +161,11 @@ func (t *Tools) UploadOneFile(r *http.Request, uploadDir string, rename ...bool)
 	}
 
 	return files[0], nil
+}
+
+func shouldRenameFile(rename ...bool) bool {
+	if len(rename) > 0 {
+		return rename[0]
+	}
+	return true
 }
